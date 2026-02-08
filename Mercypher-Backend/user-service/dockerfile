@@ -1,0 +1,25 @@
+# BUILD IMAGE FROM ROOT
+#  docker build . -f .\user-service\Dockerfile -t user-service 
+# Base Builder image for multi stage building
+FROM golang:1.25.3-alpine AS builder
+WORKDIR /user-docker
+
+# Copying only mod files for caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copying other project content and building the binary
+COPY user-service/ ./user-service
+COPY proto/ ./proto
+COPY session-service/external/client/ session-service/external/client/
+RUN go build -o main ./user-service/cmd/server
+
+FROM alpine:3.20
+WORKDIR /user-docker
+
+COPY  --from=builder /user-docker/main . 
+COPY /user-service/.env.dev ./user-service/.env.dev
+
+EXPOSE 50054
+
+CMD ["./main"]

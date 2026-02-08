@@ -1,0 +1,65 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug: User Service",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/user-service/cmd/server/main.go",
+      "cwd": "${workspaceFolder}/user-service",
+      "envFile": "${workspaceFolder}/user-service/.env.local"
+    },
+    {
+      "name": "Debug: Session Service",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/session-service/cmd/server/main.go",
+      "cwd": "${workspaceFolder}/session-service",
+      "envFile": "${workspaceFolder}/session-service/.env.local"
+    },
+    {
+      "name": "Debug: API Gateway",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/api-gateway/cmd/gateway/main.go",
+      "cwd": "${workspaceFolder}/api-gateway"
+    },
+    {
+      "name": "Debug: Message service",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/message-service/cmd/message-service/main.go",
+      "cwd": "${workspaceFolder}/message-service",
+      "envFile": "${workspaceFolder}/message-service/.env"
+    },
+    {
+      "name": "Debug: Group service",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/group-service/cmd/server/main.go",
+      "cwd": "${workspaceFolder}/group-service",
+      "envFile": "${workspaceFolder}/group-service/.env"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Debug all",
+      "configurations": [
+        "Debug: User Service",
+        "Debug: Session Service",
+        "Debug: API Gateway",
+        "Debug: Message service",
+        "Debug: Group service"
+      ],
+      "stopAll": true
+    }
+  ]
+}
