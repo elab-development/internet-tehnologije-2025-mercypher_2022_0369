@@ -2,37 +2,30 @@ package db
 
 import (
 	"fmt"
-	"log"
+	"net/url"
 	"os"
+	"time"
+
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
 
 	"github.com/Abelova-Grupa/Mercypher/user-service/internal/config"
-	"github.com/Abelova-Grupa/Mercypher/user-service/internal/models"
+	"github.com/rs/zerolog/log"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 )
 
-func GetDBUrl() string {
-	err := config.LoadEnv()
-	// If LoadEnv returns an error there is no .env file and this is run on railway
-	if err != nil {
-		return os.Getenv("USER_LOCAL_DB_URL")
-	}
-	return config.GetEnv("USER_LOCAL_DB_URL", "")
-}
-
 func Connect() *gorm.DB {
 	err := config.LoadEnv()
 	if err != nil {
-		return nil
+		fmt.Printf("no env file loaded, assuming this is a azure container instance...")
 	}
 
-	var host string
-	env := os.Getenv("ENVIRONMENT")
-	if env == "local" {
+	host := os.Getenv("POSTGRES_HOST")
+	if host == "" {
 		host = "localhost"
-	} else {
-		host = "user-db"
 	}
 
 	user := os.Getenv("POSTGRES_USER")
@@ -40,26 +33,52 @@ func Connect() *gorm.DB {
 	dbname := os.Getenv("POSTGRES_DB")
 	port := os.Getenv("POSTGRES_PORT")
 
-	dsn := fmt.Sprintf(
-		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		host, user, password, dbname, port,
-	)
+	var sslMode string
+	if os.Getenv("ENVIRONMENT") == "azure" {
+		sslMode = "sslmode=require"
+	} else {
+		sslMode = "sslmode=disable"
+	}
 
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+	migrateUrl := &url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(user, password),
+		Host:     fmt.Sprintf("%s:%s", host, port),
+		Path:     "/" + dbname,
+		RawQuery: sslMode,
+	}
+	fmt.Println(migrateUrl.String())
+	var m *migrate.Migrate
+	for i := 0; i < 10; i++ {
+		m, err = migrate.New("file://internal/migrations", migrateUrl.String())
+		if err == nil {
+			break
+		}
+		log.Info().Msg("DB not ready, retrying in 2 seconds...")
+		log.Info().Err(err).Msgf("Attempt %d: DB not ready, retrying...", i+1)
+		time.Sleep(2 * time.Second)
+	}
+
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to initialize migration engine")
+	}
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		log.Fatal().Err(err).Msg("Migrations failed.")
+	}
+
+	log.Info().Msg("Migrations applied successfully!")
+
+	db, err := gorm.Open(postgres.Open(migrateUrl.String()), &gorm.Config{
 		NamingStrategy: schema.NamingStrategy{
 			TablePrefix:   "user_service.",
 			SingularTable: false,
 		},
 	})
 	if err != nil {
-		log.Fatal("failed to connect to database: ", err)
-	}
-
-	db.Exec("CREATE SCHEMA IF NOT EXISTS user_service")
-
-	err = db.AutoMigrate(&models.User{})
-	if err != nil {
-		log.Fatal("failed to migrate database:", err)
+		log.Fatal().Err(err).Msg("failed to connect to database")
+	}else {
+		log.Info().Msg("successfully connected to the postgres database")
 	}
 
 	return db

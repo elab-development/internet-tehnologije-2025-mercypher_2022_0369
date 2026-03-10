@@ -3,14 +3,15 @@ package servers
 import (
 	// "encoding/json"
 
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
 
-	"github.com/Abelova-Grupa/Mercypher/api/internal/clients"
-	"github.com/Abelova-Grupa/Mercypher/api/internal/domain"
-	"github.com/Abelova-Grupa/Mercypher/api/internal/middleware"
-	"github.com/Abelova-Grupa/Mercypher/api/internal/websocket"
+	"github.com/Abelova-Grupa/Mercypher/api-gateway/internal/clients"
+	"github.com/Abelova-Grupa/Mercypher/api-gateway/internal/domain"
+	"github.com/Abelova-Grupa/Mercypher/api-gateway/internal/middleware"
+	"github.com/Abelova-Grupa/Mercypher/api-gateway/internal/websocket"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
@@ -23,15 +24,17 @@ import (
 //	and to define envelope messages for that purpose. Something that
 //	should be tested in the future.
 type HttpServer struct {
-	router 		*gin.Engine					// HTTP Servers internal gin router
-	wg 			*sync.WaitGroup				// Wait group that holds for HTTP server routine
-	gwIn		chan *domain.Envelope		// Channel for sending envelopes to gateway
-	gwOut		chan *domain.Envelope		// Channel for receiving envelopes from gateway
-	register	chan *websocket.Websocket	// Channel for registering new user in gateway
-	unregister	chan *websocket.Websocket	// Channel for unregistering user from gateway
+	router     *gin.Engine               // HTTP Servers internal gin router
+	wg         *sync.WaitGroup           // Wait group that holds for HTTP server routine
+	gwIn       chan *domain.Envelope     // Channel for sending envelopes to gateway
+	gwOut      chan *domain.Envelope     // Channel for receiving envelopes from gateway
+	register   chan *websocket.Websocket // Channel for registering new user in gateway
+	unregister chan *websocket.Websocket // Channel for unregistering user from gateway
 
-	userClient	*clients.UserClient			// Temporary solution for handling login requests
-	sessionClient *clients.SessionClient	// Temporary solution for handling token validation
+	userClient    *clients.UserClient    // Temporary solution for handling login requests
+	sessionClient *clients.SessionClient // Temporary solution for handling token validation
+	messageClient *clients.MessageClient
+	groupClient   *clients.GroupClient
 }
 
 type LoginRequest struct {
@@ -44,6 +47,22 @@ type RegisterRequest struct {
 	Username string `json:"username" binding:"required"`
 	Email    string `json:"email" binding:"required"`
 	Password string `json:"password" binding:"required"`
+}
+
+type ContactRequest struct {
+	Contact string `json:"contact"`
+	Nickname string `json:"nickname"`
+}
+
+type ValidateRequest struct {
+	Username string `json:"username"`
+	Code string `json:"code"`
+}
+
+type LoadMessagesRequest struct {
+	Contact string `json:"contact"`
+	Limit	int64  `json:"limit"`
+	LastSeen int64 `json:"lastSeen"`
 }
 
 func (s *HttpServer) handleLogin(ctx *gin.Context) {
@@ -61,9 +80,19 @@ func (s *HttpServer) handleLogin(ctx *gin.Context) {
 		return
 	}
 
+	ctx.SetCookie(
+		"access_token",
+		token,
+		9000,
+		"/",
+		"",
+		false,
+		true,
+	)
+
 	ctx.JSON(http.StatusOK, gin.H{
 		"message": "Login successful",
-		"token":   token,
+		"token":   token, // Delete this after testing
 	})
 }
 
@@ -93,6 +122,344 @@ func (s *HttpServer) handleLogout(ctx *gin.Context) {
 	})
 }
 
+func (s *HttpServer) handleMe(ctx *gin.Context) {
+	userID, exists := ctx.Get("userID")
+	if !exists {
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": userID})
+}
+
+func (s *HttpServer) handleLoadMessages(ctx *gin.Context) {
+	userID, exists := ctx.Get("userID")
+	if !exists {
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	var req LoadMessagesRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	username := fmt.Sprint(userID)
+
+	messages, err := s.messageClient.GetMessages(username, req.Contact, req.Limit, req.LastSeen)
+
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Messages loading failed"})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message":"Success","messages":messages})
+}
+
+func (s *HttpServer) handleCreateContact(ctx *gin.Context) {
+	userID, exists := ctx.Get("userID")
+	if !exists {
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	var req ContactRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	username := fmt.Sprint(userID)
+
+	if err := s.userClient.CreateContact(username, req.Contact, req.Nickname); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to create contact."})
+	} else {
+		ctx.JSON(http.StatusOK, gin.H{"message": "Contact saved."})
+	}
+}
+
+func (s *HttpServer) handleUpdateContact(ctx *gin.Context) {
+	userID, exists := ctx.Get("userID")
+	if !exists {
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	var req ContactRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	username := fmt.Sprint(userID)
+
+	if err := s.userClient.UpdateContact(username, req.Contact, req.Nickname); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to update contact."})
+	} else {
+		ctx.JSON(http.StatusOK, gin.H{"message": "Contact saved."})
+	}
+}
+
+func (s *HttpServer) handleDeleteContact(ctx *gin.Context) {
+	userID, exists := ctx.Get("userID")
+	if !exists {
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	var req ContactRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	username := fmt.Sprint(userID)
+
+	if err := s.userClient.DeleteContact(username, req.Contact); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to delete contact."})
+	} else {
+		ctx.JSON(http.StatusOK, gin.H{"message": "Contact deleted."})
+	}
+}
+
+func (s *HttpServer) handleGetcontacts(ctx *gin.Context) {
+	userID, exists := ctx.Get("userID")
+	if !exists {
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	username := fmt.Sprint(userID)
+
+	if resp, err := s.userClient.GetContacts(username); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to retrieve contacts."})
+	} else {
+		ctx.JSON(http.StatusOK, gin.H{"message": "Success.", "contacts":resp})
+	}
+}
+
+func (s *HttpServer) handleCreateGroup(ctx *gin.Context) {
+    userID, exists := ctx.Get("userID")
+    if !exists {
+        ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+        return
+    }
+
+    var req struct {
+        Name string `json:"name" binding:"required"`
+    }
+    if err := ctx.ShouldBindJSON(&req); err != nil {
+        ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+        return
+    }
+
+    creatorID := fmt.Sprint(userID)
+
+    group, err := s.groupClient.CreateGroup(ctx.Request.Context(), req.Name, creatorID)
+    if err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create group"})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{
+        "message": "Group created successfully",
+        "group":   group,
+    })
+}
+
+func (s *HttpServer) handleAddMember(ctx *gin.Context) {
+    userID, exists := ctx.Get("userID")
+    if !exists {
+        ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+        return
+    }
+
+    var req struct {
+        GroupID string `json:"group_id" binding:"required"`
+        UserID  string `json:"user_id" binding:"required"`
+    }
+    if err := ctx.ShouldBindJSON(&req); err != nil {
+        ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+        return
+    }
+
+    requesterID := fmt.Sprint(userID)
+
+    err := s.groupClient.AddMember(ctx.Request.Context(), req.GroupID, requesterID, req.UserID)
+    if err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add member"})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{"message": "Member added successfully"})
+}
+
+func (s *HttpServer) handleGetUserGroups(ctx *gin.Context) {
+    userID, exists := ctx.Get("userID")
+    if !exists {
+        ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+        return
+    }
+
+    currentUserID := fmt.Sprint(userID)
+
+    groups, err := s.groupClient.GetUserGroups(ctx.Request.Context(), currentUserID)
+    if err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch user groups"})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{
+        "message": "Success",
+        "groups":  groups,
+    })
+}
+
+func (s *HttpServer) handleDeleteGroup(ctx *gin.Context) {
+    userID, exists := ctx.Get("userID")
+    if !exists {
+        ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+        return
+    }
+
+    var req struct {
+        GroupID string `json:"group_id" binding:"required"`
+    }
+    if err := ctx.ShouldBindJSON(&req); err != nil {
+        ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+        return
+    }
+
+    requesterID := fmt.Sprint(userID)
+
+    err := s.groupClient.DeleteGroup(ctx.Request.Context(), req.GroupID, requesterID)
+    if err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete group"})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{"message": "Group deleted successfully"})
+}
+
+func (s *HttpServer) handleUpdateGroup(ctx *gin.Context) {
+    userID, exists := ctx.Get("userID")
+    if !exists {
+        ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+        return
+    }
+
+    var req struct {
+        GroupID string `json:"group_id" binding:"required"`
+        NewName string `json:"new_name" binding:"required"`
+    }
+    if err := ctx.ShouldBindJSON(&req); err != nil {
+        ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+        return
+    }
+
+    requesterID := fmt.Sprint(userID)
+
+    group, err := s.groupClient.UpdateGroup(ctx.Request.Context(), req.GroupID, requesterID, req.NewName)
+    if err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update group"})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{
+        "message": "Group updated successfully",
+        "group":   group,
+    })
+}
+
+func (s *HttpServer) handleRemoveMember(ctx *gin.Context) {
+    userID, exists := ctx.Get("userID")
+    if !exists {
+        ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+        return
+    }
+
+    var req struct {
+        GroupID string `json:"group_id" binding:"required"`
+        UserID  string `json:"user_id" binding:"required"`
+    }
+    if err := ctx.ShouldBindJSON(&req); err != nil {
+        ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+        return
+    }
+
+    requesterID := fmt.Sprint(userID)
+
+    err := s.groupClient.RemoveMember(ctx.Request.Context(), req.GroupID, requesterID, req.UserID)
+    if err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove member"})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{"message": "Member removed successfully"})
+}
+
+func (s *HttpServer) handleChangeMemberRole(ctx *gin.Context) {
+    userID, exists := ctx.Get("userID")
+    if !exists {
+        ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+        return
+    }
+
+    var req struct {
+        GroupID string `json:"group_id" binding:"required"`
+        UserID  string `json:"user_id" binding:"required"`
+        NewRole int32  `json:"new_role" binding:"required"`
+    }
+    if err := ctx.ShouldBindJSON(&req); err != nil {
+        ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+        return
+    }
+
+    requesterID := fmt.Sprint(userID)
+
+    err := s.groupClient.ChangeMemberRole(ctx.Request.Context(), req.GroupID, requesterID, req.UserID, req.NewRole)
+    if err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to change member role"})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{"message": "Role updated successfully"})
+}
+
+func (s *HttpServer) handleGetGroupMembers(ctx *gin.Context) {
+    groupID := ctx.Query("group_id")
+    if groupID == "" {
+        ctx.JSON(http.StatusBadRequest, gin.H{"error": "group_id is required"})
+        return
+    }
+
+    members, err := s.groupClient.GetGroupMembers(ctx.Request.Context(), groupID)
+    if err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch members"})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{
+        "message": "Success",
+        "members": members,
+    })
+}
+
+func (s *HttpServer) handleValidateAccount(ctx *gin.Context) {
+	var req ValidateRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	if err := s.userClient.ValidateAccount(req.Username, req.Code); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to validate account."})
+	} else {
+		ctx.JSON(http.StatusOK, gin.H{"message": "User validated."})
+	}
+}
+
 func (s *HttpServer) handleWebSocket(ctx *gin.Context) {
 	// Upgrade HTTP connection to WebSocket
 	conn, err := websocket.Upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
@@ -101,16 +468,22 @@ func (s *HttpServer) handleWebSocket(ctx *gin.Context) {
 		return
 	}
 
+	userID, exists := ctx.Get("userID")
+	if !exists {
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
 	ws := websocket.NewWebsocket(conn, domain.User{
-		UserId:   "example",
-		Username: "testUser",
-		Email:    "test@user.rs",
-	}, s.unregister)
+		UserId:   fmt.Sprint(userID), // TODO: Remove id for its the same as username
+		Username: fmt.Sprint(userID),
+		Email:    "", // Nil here because (for now) we are only iterested in username
+	}, s.unregister, s.gwIn)
 
 	//TODO: Register this ws in gateway.
 	s.register <- ws
 
-	// Handle this client in a new goroutine
+	// Handle this client in a new goroutine    // HttpOnly
 	go ws.HandleClient()
 }
 
@@ -125,15 +498,47 @@ func (s *HttpServer) setupRoutes() {
 	s.router.POST("/login", s.handleLogin)
 	s.router.POST("/register", s.handleRegister)
 
+	// Contact POST methods
+	s.router.POST("/createContact", middleware.AuthMiddleware(s.userClient), s.handleCreateContact)
+	s.router.POST("/deleteContact", middleware.AuthMiddleware(s.userClient), s.handleDeleteContact)
+	s.router.POST("/updateContact", middleware.AuthMiddleware(s.userClient), s.handleUpdateContact)
+
+	// Message loader POST method
+	s.router.POST("/loadMessages", middleware.AuthMiddleware(s.userClient), s.handleLoadMessages)
+
+	s.router.POST("/validate", s.handleValidateAccount)
+
+	// Group POST methods
+	s.router.POST("/createGroup", middleware.AuthMiddleware(s.userClient), s.handleCreateGroup)
+	s.router.POST("/deleteGroup", middleware.AuthMiddleware(s.userClient), s.handleDeleteGroup)
+	s.router.POST("/updateGroup", middleware.AuthMiddleware(s.userClient), s.handleUpdateGroup)
+	s.router.POST("/addGroupMember", middleware.AuthMiddleware(s.userClient), s.handleAddMember)
+	s.router.POST("/removeGroupMember", middleware.AuthMiddleware(s.userClient), s.handleRemoveMember)
+	s.router.POST("/changeMemberRole", middleware.AuthMiddleware(s.userClient), s.handleChangeMemberRole)
+
 	// HTTP GET requset routes.
-	//
 	// Websocket route (/ws) must contain a valid token issued by login request.
 	s.router.GET("/logout", s.handleLogout)
-	s.router.GET("/ws", middleware.AuthMiddleware(s.sessionClient), s.handleWebSocket)
-} 
+	s.router.GET("/ws", middleware.AuthMiddleware(s.userClient), s.handleWebSocket)
 
+	s.router.GET("/me", middleware.AuthMiddleware(s.userClient), s.handleMe)
 
-func NewHttpServer(wg *sync.WaitGroup, gwIn chan *domain.Envelope, gwOut chan *domain.Envelope, reg chan *websocket.Websocket, unreg chan *websocket.Websocket) *HttpServer {
+	s.router.GET("/contacts", middleware.AuthMiddleware(s.userClient), s.handleGetcontacts)
+	s.router.GET("/userGroups", middleware.AuthMiddleware(s.userClient), s.handleGetUserGroups)
+	s.router.GET("/groupMembers", middleware.AuthMiddleware(s.userClient), s.handleGetGroupMembers)
+}
+
+func NewHttpServer(
+	wg *sync.WaitGroup, 
+	gwIn chan *domain.Envelope, 
+	gwOut chan *domain.Envelope, 
+	reg chan *websocket.Websocket, 
+	unreg chan *websocket.Websocket,
+	userClient *clients.UserClient,
+	sessionClient *clients.SessionClient,
+	messageClient *clients.MessageClient,
+	groupClient *clients.GroupClient,
+	) *HttpServer {
 
 	// Change to gin.DebugMode for development
 	gin.SetMode(gin.ReleaseMode)
@@ -145,7 +550,14 @@ func NewHttpServer(wg *sync.WaitGroup, gwIn chan *domain.Envelope, gwOut chan *d
 		AllowOrigins: []string{"http://localhost:5173"},
 		AllowHeaders: []string{"Origin", "Content-Type"},
 		AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowCredentials: true,
 	}))
+
+	// Clients to other serivces
+	server.userClient = userClient
+	server.sessionClient = sessionClient
+	server.messageClient = messageClient
+	server.groupClient = groupClient
 
 	// Server parameters
 	server.wg = wg
@@ -158,9 +570,6 @@ func NewHttpServer(wg *sync.WaitGroup, gwIn chan *domain.Envelope, gwOut chan *d
 
 	server.register = reg
 	server.unregister = unreg
-
-	server.userClient, _ = clients.NewUserClient("localhost:50054")
-	server.sessionClient, _ = clients.NewSessionClient("localhost:50055")
 
 	return server
 }

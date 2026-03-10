@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"github.com/Abelova-Grupa/Mercypher/api/internal/domain"
+	"time"
+
+	"github.com/Abelova-Grupa/Mercypher/api-gateway/internal/domain"
+
 	// "sync"
 
 	"github.com/gorilla/websocket"
@@ -19,12 +22,12 @@ type Websocket struct {
 	unregister	chan *Websocket
 }
 
-func NewWebsocket(conn *websocket.Conn, client domain.User, unregister chan *Websocket) *Websocket {
+func NewWebsocket(conn *websocket.Conn, client domain.User, unregister chan *Websocket, in chan *domain.Envelope) *Websocket {
 	return &Websocket{
 		Conn: 	conn,
 		Client: client,
-		In:		make(chan *domain.Envelope),
-		Out: 	make(chan *domain.Envelope),
+		In:		in,
+		Out: 	make(chan *domain.Envelope, 100),
 		unregister: unregister,
 	}
 }
@@ -54,9 +57,56 @@ func (s *Websocket) Respond(messageType int, env domain.Envelope) error {
 
 }
 
+// So, it appears that golang doesn't support function overloading...
+func (s *Websocket) SendChatMessage(msg domain.ChatMessage) error {
+
+	// Vukovo seljacko resenje
+	if msg.Timestamp == 0 {
+        msg.Timestamp = time.Now().Unix()
+    }
+	
+	jsonMessage, err := json.Marshal(msg)
+
+	if err != nil {
+		log.Println("Error marshaling message: ", err)
+		return err
+	}
+
+	env := domain.Envelope{Type: "message", Data: jsonMessage}
+
+	return s.Respond(websocket.TextMessage, env)
+
+}
+
+func (s *Websocket) SendMessageAck(msg domain.ChatMessage) error {
+
+	// Vukovo seljacko resenje
+	if msg.Timestamp == 0 {
+        msg.Timestamp = time.Now().Unix()
+    }
+	
+	jsonMessage, err := json.Marshal(msg)
+
+	if err != nil {
+		log.Println("Error marshaling message: ", err)
+		return err
+	}
+
+	env := domain.Envelope{Type: "message_ack", Data: jsonMessage}
+
+	return s.Respond(websocket.TextMessage, env)
+
+}
+
 func (s *Websocket) HandleClient() {
 	defer s.Conn.Close()
 	log.Println("New client handler started @", s.Conn.RemoteAddr())
+
+	s.Conn.SetReadDeadline(time.Now().Add(180 * time.Second))
+    s.Conn.SetPongHandler(func(string) error { 
+        s.Conn.SetReadDeadline(time.Now().Add(180 * time.Second))
+        return nil 
+    })
 
 	for {
 		// Read a message from the client
@@ -69,6 +119,7 @@ func (s *Websocket) HandleClient() {
 				break
             } else {
 				log.Println("Error reading message:", err)
+				return
 			}
 		}
 
@@ -88,10 +139,24 @@ func (s *Websocket) HandleClient() {
 			if err := s.Respond(websocket.PongMessage, domain.Envelope{Type: "pong", Data: nil}); err != nil {
 				log.Println("Couldn't respond.")
 			}
-		case "message":
+		case "message": {
+			log.Println("Message received on ws.")
 			if err := s.Respond(websocket.TextMessage, domain.Envelope{Type: "message received", Data: nil}); err != nil {
 				log.Println("Couldn't respond.")
 			}
+
+			// Deconstruct, add metedata, package again.
+			// Temporary solution
+			var chatMsg domain.ChatMessage
+					if err := json.Unmarshal(env.Data, &chatMsg); err != nil {
+						log.Println("Invalid message format:", err)
+						continue
+					}
+			chatMsg.SenderId = s.Client.UserId
+			env.Data, _ = json.Marshal(chatMsg)
+			// FIX NAMING OF THESE
+			s.In <- &env
+		}
 		default:
 			if err := s.Respond(websocket.TextMessage, domain.Envelope{Type: "invalid type received", Data: nil}); err != nil {
 				log.Println("Couldn't respond.")

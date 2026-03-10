@@ -3,68 +3,55 @@ package main
 import (
 	//"context"
 
-	"log"
+	"fmt"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"google.golang.org/grpc"
 
-	pb "github.com/Abelova-Grupa/Mercypher/user-service/external/proto"
+	userpb "github.com/Abelova-Grupa/Mercypher/proto/user"
 	"github.com/Abelova-Grupa/Mercypher/user-service/internal/config"
 	"github.com/Abelova-Grupa/Mercypher/user-service/internal/db"
 	"github.com/Abelova-Grupa/Mercypher/user-service/internal/grpc/server"
+	worker "github.com/Abelova-Grupa/Mercypher/user-service/internal/worker"
+	"github.com/rs/zerolog/log"
 )
 
-// TODO: Move to config?
-// func getDatabaseParameters() string {
-// 	config.LoadEnv()
-
-// 	user := config.GetEnv("DB_USER", "postgres")
-// 	pass := config.GetEnv("DB_PASSWORD", "")
-// 	host := config.GetEnv("DB_HOST", "127.0.0.1")
-// 	port := config.GetEnv("DB_PORT", "5432")
-// 	name := config.GetEnv("DB_NAME", "users")
-// 	ssl := config.GetEnv("DB_SSLMODE", "disable")
-// 	tz := config.GetEnv("DB_TIMEZONE", "UTC")
-
-// 	return fmt.Sprintf(
-// 		"postgres://%s:%s@%s:%s/%s?sslmode=%s&timezone=%s",
-// 		user, pass, host, port, name, ssl, tz,
-// 	)
-// }
-
+// I will leave this main function as is, so if there is some need for extension we can just add another go routine
 func main() {
-	conn := db.Connect()
+	if err := config.LoadEnv(); err != nil {
+		fmt.Println("no env loaded assuming this is azure container environment")
+	}
+	var asynqTask worker.TaskAsynq
+	if os.Getenv("ENVIRONMENT") == "azure" {
+		asynqTask = &worker.AzureTaskAsynq{}
+	} else {
+		asynqTask = &worker.LocalTaskAsynq{}
+	}
 
+	go asynqTask.RunTaskProcessor()
+	go startUserServiceServer()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+}
+
+func startUserServiceServer() {
+	conn := db.Connect()
 	port := config.GetEnv("USER_SERVICE_PORT", "")
-	listener, err := net.Listen("tcp", ":"+port)
+	listener, err := net.Listen("tcp", "0.0.0.0:"+port)
 	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
+		log.Fatal().Err(err).Msg("failed to listen to start user service")
 	}
 
 	grpcServer := grpc.NewServer()
-	pb.RegisterUserServiceServer(grpcServer, server.NewGrpcServer(conn))
+	userpb.RegisterUserServiceServer(grpcServer, server.NewGrpcServer(conn))
 
-	log.Printf("starting user service grpc server on port %v", port)
+	log.Printf("starting user service grpc server on port %v...", port)
 	if err := grpcServer.Serve(listener); err != nil {
-		log.Fatalf("failed to serve: %v", err)
+		log.Fatal().Err(err).Msg("failed to server grpc request")
 	}
-
-	// Setup the router and start routing
-	// router := routes.SetupRouter(userHandler)
-	// if err := router.Run(":8080"); err != nil {
-	// 	log.Fatal("Failed to start server:", err)
-	// }
-
-	// TESTING
-	// test_user := models.User{
-	// 	ID: "1",
-	// 	Username: "jezdimir1",
-	// 	Email: "jezdimir.bekrija1@gmail.com",
-	// 	PasswordHash: "RodjaRaicevic123",
-	// }
-
-	// test_user2, _ := userRepo.GetUserByID(context.Background(), "0")
-	// log.Println(*test_user2)
-
-	//userRepo.CreateUser(context.Background(), &test_user)
 }

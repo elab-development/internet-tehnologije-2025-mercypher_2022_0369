@@ -1,21 +1,26 @@
 PROTO_DIR = proto
 
-GATEWAY_PROTO_FILES = proto/api-gateway.proto
-OUT_GATEWAY = api-gateway/external/grpc
+GATEWAY_PROTO_FILES = proto/gateway/api-gateway.proto
+OUT_GATEWAY = proto
 
-SESSION_PROTO_FILES = proto/session-service.proto
-OUT_SESSION = session-service/external/proto
+SESSION_PROTO_FILES = proto/session/session-service.proto
+OUT_SESSION = proto
 
-MESSAGE_PROTO_FILES = proto/message-service.proto
-OUT_MESSAGE = message-service/external/grpc
+MESSAGE_PROTO_FILES = proto/message/message-service.proto
+OUT_MESSAGE = proto
 
-USER_PROTO_FILES = proto/user-service.proto
-OUT_USER = user-service/external/proto
+USER_PROTO_FILES = proto/user/user-service.proto
+OUT_USER = proto
 
-.PHONY: proto 
+REDIS_CONTAINER = redis-mercypher
 
-# Make proto runs all services, Make gateway only runs gateway
-proto: gateway session
+POSTGRES_USER=
+POSTGRES_PASS=
+
+.PHONY: proto redis-up redis-down migrate-user-up migrate-user-down
+
+# make proto runs all services, make gateway only runs gateway
+proto: gateway session user message
 
 gateway:
 	protoc \
@@ -29,13 +34,10 @@ gateway:
 session:
 	protoc \
 		--proto_path=$(PROTO_DIR) \
-		--proto_path=googleapis \
 		--go_out=$(OUT_SESSION) \
 		--go-grpc_out=$(OUT_SESSION) \
 		--go_opt=paths=source_relative \
 		--go-grpc_opt=paths=source_relative \
-		--grpc-gateway_out=$(OUT_SESSION) \
-  		--grpc-gateway_opt=paths=source_relative \
 		$(SESSION_PROTO_FILES)
 
 message:
@@ -55,3 +57,24 @@ user:
 		--go_opt=paths=source_relative \
 		--go-grpc_opt=paths=source_relative \
 		$(USER_PROTO_FILES)
+
+redis-up:
+	if [ -z $$(docker ps -a -q -f name=$(REDIS_CONTAINER)) ]; then \
+		echo "Bulding redis container..."; \
+		docker run --name $(REDIS_CONTAINER) -d -p 6379:6379 redis:8.2-alpine; \
+	else \
+		echo "Redis container already exists, running..."; \
+		docker start $(REDIS_CONTAINER); \
+	fi
+
+
+redis-down:	
+	docker stop $(REDIS_CONTAINER) && docker rm $(REDIS_CONTAINER)
+
+# migrate-user-up POSTGRES_USER=your_user POSTGRES_PASS=your_pass
+migrate-user-up:
+	migrate -path ./user-service/internal/migrations -database postgres://$(POSTGRES_USER):$(POSTGRES_PASS)@localhost:5432/mercypher?sslmode=disable up
+# migrate-user-down POSTGRES_USER=your_user POSTGRES_PASS=your_pass
+migrate-user-down:
+	migrate -path ./user-service/internal/migrations -database postgres://$(POSTGRES_USER):$(POSTGRES_PASS)@localhost:5432/mercypher?sslmode=disable down
+

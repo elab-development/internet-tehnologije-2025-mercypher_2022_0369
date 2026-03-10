@@ -1,116 +1,107 @@
 package main
 
 import (
-	//"context"
-	"fmt"
+	"context"
 	"log"
 	"net"
-
-	//"time"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 
 	"github.com/Abelova-Grupa/Mercypher/message-service/internal/config"
-	"github.com/Abelova-Grupa/Mercypher/message-service/internal/model"
+	"github.com/Abelova-Grupa/Mercypher/message-service/internal/kafka"
 	"github.com/Abelova-Grupa/Mercypher/message-service/internal/repository"
 	"github.com/Abelova-Grupa/Mercypher/message-service/internal/server"
-	"github.com/Abelova-Grupa/Mercypher/message-service/internal/service"
-	messagepb "github.com/Abelova-Grupa/Mercypher/message-service/external/grpc"
-
+	"github.com/Abelova-Grupa/Mercypher/message-service/internal/store"
+	pb "github.com/Abelova-Grupa/Mercypher/proto/message"
+	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
-
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
 )
 
-func getDatabaseParameters() string {
-	config.LoadEnv()
-
-	user := config.GetEnv("DB_USER", "postgres")
-	pass := config.GetEnv("DB_PASSWORD", "")
-	host := config.GetEnv("DB_HOST", "127.0.0.1")
-	port := config.GetEnv("DB_PORT", "5432")
-	name := config.GetEnv("DB_NAME", "mercypher_msg")
-	ssl := config.GetEnv("DB_SSLMODE", "disable")
-	tz := config.GetEnv("DB_TIMEZONE", "UTC")
-
-	return fmt.Sprintf(
-		"postgres://%s:%s@%s:%s/%s?sslmode=%s&timezone=%s",
-		user, pass, host, port, name, ssl, tz,
-	)
-}
-
-// TODO: Move to config?
-func connect(dsn string) *gorm.DB {
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	log.Println("Attempting to connect to the messages database...")
-	if err != nil {
-		log.Fatal("Failed to connect to database:", err)
-	} else {
-		log.Println("Connected to the users database.")
-	}
-
-	// Auto-migrate
-	if err := db.AutoMigrate(&model.ChatMessage{}); err != nil {
-		log.Fatal("auto-migration failed:", err)
-	}
-
-	return db
-}
-
 func main() {
-	conn := connect(getDatabaseParameters())
-	repo := repository.NewMessageRepository(conn)
-	service := service.NewMessageService(repo)
-	server := server.NewMessageServer(service)
+	// runing configuration
+	config.LoadEnv()
+	port := config.GetEnv("PORT", "50052")
 
-	listener, err := net.Listen("tcp", ":50051")
-	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
-	}
-
-	grpcServer := grpc.NewServer()
-	messagepb.RegisterMessageServiceServer(grpcServer, server)
-	if err := grpcServer.Serve(listener); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
-	}
-
-	// server := server.NewMessageServer()
-	// var msg model.ChatMessage
-	// msg.Message_id = "test_DZJLKAFSKJGDKJHFGJHLI"
-	// msg.Sender_id = "testuser2"
-	// msg.Receiver_id = "testuser1"
-	// msg.Body = "Proba proba jen dva tri"
-	// msg.Timestamp = time.Now()
-	// repo.CreateMessage(context.Background(), &msg)
-
-	// ######################
-	// 	Code used for texting relay client
-	// ctx := context.Background()
-	// channel := make(chan func(), 5)
-	// defer close(channel)
-	// go relay_client.StartClient(channel)
-
-	// scanner := bufio.NewScanner(os.Stdin)
-	// for {
-	// 	fmt.Print("Enter a message (or 'exit' to quit): ")
-	// 	if !scanner.Scan() {
-	// 		break
-	// 	}
-	// 	text := scanner.Text()
-
-	// 	if text == "exit" {
-	// 		break
-	// 	}
-	// 	msg := model.ChatMessage{
-	// 		Message_id:  "123",
-	// 		Sender_id:   "steven",
-	// 		Receiver_id: "derek",
-	// 		Body:        text,
-	// 		Timestamp:   time.Now(),
-	// 	}
-
-	// 	// Send a function that prints the message
-	// 	channel <- func() {
-	// 		_ = relay_client.RelayMessage(ctx, &msg)
-	// 	}
+	// host := config.GetEnv("DB_HOST", "localhost")
+	// dbPort := config.GetEnv("DB_PORT", "5433")
+	// user := config.GetEnv("POSTGRES_USER", "mercypher_admin")
+	// pass := config.GetEnv("POSTGRES_PASSWORD", "password321")
+	// name := config.GetEnv("POSTGRES_DB", "message_db")
+	// dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+	// 	host, dbPort, user, pass, name)
+	// db, err :=
+	// db, err := sql.Open("postgres", dsn)
+	// if err != nil {
+	// 	log.Fatalf("Failed to connect to DB: %v", err)
 	// }
+	// defer db.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Switched from sql to gorm
+	db, err := store.NewMessageDB(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	dbConn, err := db.DB()
+	if err != nil {
+		panic(err)
+	}
+	defer dbConn.Close()
+	// log.Printf("Connected to postres -> " + dsn)
+	repo := repository.NewMessageRepository(db)
+
+	var msgServer pb.MessageServiceServer
+	if os.Getenv("ENVIRONMENT") == "azure" {
+		msgServer = server.NewAzureMessageServer(ctx, repo)
+		azureServer, ok := msgServer.(*server.AzureMessageServer)
+		if !ok {
+			panic("cannot cast message server to azure server in azure environment")
+		}
+		go azureServer.TopicReceiver.Start(ctx)
+		defer azureServer.TopicReceiver.Close(ctx)
+		
+	} else {
+		kafkaBrokerEnv := config.GetEnv("KAFKA_BROKERS", "localhost:9092")
+		brokers := strings.Split(kafkaBrokerEnv, ",")
+		consumer := kafka.NewKafkaConsumer(repo, brokers)
+		go consumer.Start(ctx)
+		defer consumer.Close()
+
+		msgServer = server.NewKafkaMessageServer(brokers, repo)
+	}
+
+	// starting a listener
+	lis, err := net.Listen("tcp", "0.0.0.0:"+port)
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	// starting grpc server with message service
+	grpcServer := grpc.NewServer()
+	pb.RegisterMessageServiceServer(grpcServer, msgServer)
+
+	go func() {
+		log.Printf("Message Service is running on port %s...", port)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Printf("failed to serve: %v", err)
+			cancel()
+		}
+	}()
+
+	// Starting kafka consumer for live message forwarding messages
+	// gatewayAdr := config.GetEnv("GATEWAY_ADDRESS", "localhost:50051") // if set then its running in a container, otherwise locally
+	// go kafka.StartLiveForwarder(context.Background(), brokers, gatewayAdr)
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	<-stop
+
+	log.Println("Shutting down gRPC server...")
+	grpcServer.GracefulStop()
+	log.Println("Server stopped.")
 }

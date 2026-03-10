@@ -4,129 +4,108 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/Abelova-Grupa/Mercypher/session-service/internal/models"
-
-	"gorm.io/gorm"
+	"github.com/redis/go-redis/v9"
 )
 
 type SessionRepository interface {
 	CreateSession(ctx context.Context, session *models.Session) (*models.Session, error)
-	GetSessionByUserID(ctx context.Context, ID string) (*models.Session, error)
-	GetSessionByRefreshToken(ctx context.Context, refreshToken string) (*models.Session, error)
+	GetSessionByUsername(ctx context.Context, username string) (*models.Session, error)
 	UpdateSession(ctx context.Context, session *models.Session) (*models.Session, error)
-
-	CreateLastSeen(ctx context.Context, lastSeen *models.LastSeenSession) (*models.LastSeenSession, error)
-	GetLastSeenByUserID(ctx context.Context, userID string) (*models.LastSeenSession, error)
-	UpdateLastSeen(ctx context.Context, lastSeen *models.LastSeenSession) (*models.LastSeenSession, error)
-	DeleteLastSeen(ctx context.Context, userID string) error
-
-	CreateUserLocation(tx context.Context, userLocation *models.UserLocation) (*models.UserLocation, error)
-	GetUserLocationByUserID(tx context.Context, userID string) (*models.UserLocation, error)
-	UpdateUserLocation(tx context.Context, userLocation *models.UserLocation) (*models.UserLocation, error)
-	DeleteUserLocation(ctx context.Context, userID string) error
 }
 
 type SessionRepo struct {
-	DB *gorm.DB
+	RDB *redis.Client
 }
 
-func NewSessionRepository(db *gorm.DB) *SessionRepo {
-	return &SessionRepo{DB: db}
+func NewSessionRepository(redis_cli *redis.Client) *SessionRepo {
+	return &SessionRepo{RDB: redis_cli}
 }
 
 func (s *SessionRepo) CreateSession(ctx context.Context, session *models.Session) (*models.Session, error) {
-	err := s.DB.WithContext(ctx).Create(session).Error
-	if err != nil {
-		return nil, fmt.Errorf("unable to store a new session in db: %v", err)
+	sessionKey := fmt.Sprintf("session:%s", session.Username)
+	m := map[string]interface{}{
+		"username":       session.Username,
+		"is_active":      session.IsActive,
+		"connected_at":   session.ConnectedAt.Unix(),
+		"last_seen_time": session.LastSeenTime.Unix(),
 	}
+	err := s.RDB.HSet(ctx, sessionKey, m).Err()
+	if err != nil {
+		return nil, fmt.Errorf("unable to store a new session in redis cache: %w", err)
+	}
+
 	return session, nil
 }
 
-// Should return payloadID from refreshToken
-func (s *SessionRepo) GetSessionByUserID(ctx context.Context, ID string) (*models.Session, error) {
-	var session models.Session
-	result := s.DB.WithContext(ctx).Where("user_id = ?", ID).First(&session)
-	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-		return nil, result.Error
+func (s *SessionRepo) GetSessionByUsername(ctx context.Context, username string) (*models.Session, error) {
+	sessionKey := fmt.Sprintf("session:%s", username)
+	res, err := s.RDB.HGetAll(ctx, sessionKey).Result()
+	if len(res) == 0 {
+		return nil, fmt.Errorf("no session for user %v", username)
 	}
-	return &session, result.Error
-}
 
-func (s *SessionRepo) GetSessionByRefreshToken(ctx context.Context, refreshToken string) (*models.Session, error) {
-	var session models.Session
-	result := s.DB.WithContext(ctx).Where("refresh_token = ?", refreshToken).First(&session)
-	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-		return nil, nil
+	session, err := convertRedisHashToSession(res)
+	session.Username = username
+	if err != nil {
+		return nil, fmt.Errorf("redis hash to struct conversion failed: %w", err)
 	}
-	return &session, result.Error
+
+	return session, nil
 }
 
 func (s *SessionRepo) UpdateSession(ctx context.Context, session *models.Session) (*models.Session, error) {
-	err := s.DB.WithContext(ctx).Save(session).Error
+	var res map[string]string
+	var err error
+	m := convertSessionToRedisHash(session)
+	sessionKey := fmt.Sprintf("session:%s", session.Username)
+	err = s.RDB.HSet(ctx, sessionKey, m).Err()
 	if err != nil {
-		return nil, fmt.Errorf("unable to store an updated session in db: %v", err)
+		return nil, fmt.Errorf("unable to store a new session in redis cache: %w", err)
 	}
+
+	res, err = s.RDB.HGetAll(ctx, sessionKey).Result()
+	if errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+
+	session, err = convertRedisHashToSession(res)
+	if err != nil {
+		return nil, fmt.Errorf("redis hash to struct conversion failed: %w", err)
+	}
+
 	return session, nil
 }
 
-func (s *SessionRepo) CreateLastSeen(ctx context.Context, lastSeen *models.LastSeenSession) (*models.LastSeenSession, error) {
-	err := s.DB.WithContext(ctx).Create(lastSeen).Error
+func convertRedisHashToSession(m map[string]string) (*models.Session, error) {
+	session := &models.Session{Username: m["username"]}
+	connectedAt, err := strconv.ParseInt(m["connected_at"], 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("unable to store a new last seen object to db: %v", err)
+		return nil, err
 	}
-	return lastSeen, nil
-}
-
-func (s *SessionRepo) GetLastSeenByUserID(ctx context.Context, userID string) (*models.LastSeenSession, error) {
-	var lastSeen models.LastSeenSession
-	result := s.DB.WithContext(ctx).Where("user_id = ?", userID).First(&lastSeen)
-
-	return &lastSeen, result.Error
-}
-
-func (s *SessionRepo) UpdateLastSeen(ctx context.Context, lastSeen *models.LastSeenSession) (*models.LastSeenSession, error) {
-	err := s.DB.WithContext(ctx).Save(lastSeen).Error
+	last_seen_time, err := strconv.ParseInt(m["last_seen_time"], 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("unable to store an updated last seen object to db: %v", err)
+		return nil, err
 	}
-	return lastSeen, nil
-}
-
-func (s *SessionRepo) DeleteLastSeen(ctx context.Context, userID string) error {
-	err := s.DB.Delete(&models.LastSeenSession{}, userID).Error
+	is_active, err := strconv.ParseBool(m["is_active"])
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+
+	session.ConnectedAt = time.Unix(connectedAt, 0)
+	session.LastSeenTime = time.Unix(last_seen_time, 0)
+	session.IsActive = is_active
+	return session, nil
 }
 
-func (s *SessionRepo) CreateUserLocation(ctx context.Context, userLocation *models.UserLocation) (*models.UserLocation, error) {
-	err := s.DB.WithContext(ctx).Create(userLocation).Error
-	if err != nil {
-		return nil, fmt.Errorf("unable to store new user location in db: %v", err)
+func convertSessionToRedisHash(session *models.Session) (m map[string]interface{}) {
+	return map[string]interface{}{
+		"username":       session.Username,
+		"is_active":      session.IsActive,
+		"connected_at":   session.ConnectedAt.Unix(),
+		"last_seen_time": session.LastSeenTime.Unix(),
 	}
-	return userLocation, nil
-}
-
-func (s *SessionRepo) GetUserLocationByUserID(ctx context.Context, userID string) (*models.UserLocation, error) {
-	var userLocation models.UserLocation
-	results := s.DB.WithContext(ctx).Where("user_id = ?", userID).First(&userLocation)
-	return &userLocation, results.Error
-}
-
-func (s *SessionRepo) UpdateUserLocation(ctx context.Context, userLocation *models.UserLocation) (*models.UserLocation, error) {
-	err := s.DB.WithContext(ctx).Save(userLocation).Error
-	if err != nil {
-		return nil, fmt.Errorf("unable to store updated user location in db: %v", err)
-	}
-	return userLocation, nil
-}
-
-func (s *SessionRepo) DeleteUserLocation(ctx context.Context, userId string) error {
-	err := s.DB.Delete(&models.UserLocation{}, userId).Error
-	if err != nil {
-		return err
-	}
-	return nil
 }

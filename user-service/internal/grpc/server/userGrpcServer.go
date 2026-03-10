@@ -5,11 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"time"
 
-	sessionClient "github.com/Abelova-Grupa/Mercypher/session-service/external/client"
-	sessionpb "github.com/Abelova-Grupa/Mercypher/session-service/external/proto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	pb "github.com/Abelova-Grupa/Mercypher/user-service/external/proto"
+	sessionpb "github.com/Abelova-Grupa/Mercypher/proto/session"
+	userpb "github.com/Abelova-Grupa/Mercypher/proto/user"
+	"github.com/Abelova-Grupa/Mercypher/user-service/internal/models"
 	"github.com/Abelova-Grupa/Mercypher/user-service/internal/repository"
 	"github.com/Abelova-Grupa/Mercypher/user-service/internal/service"
 	"gorm.io/gorm"
@@ -19,89 +28,226 @@ type GrpcServer struct {
 	userDB      *gorm.DB
 	userRepo    repository.UserRepository
 	userService service.UserService
-	pb.UnsafeUserServiceServer
-	sessionClient sessionClient.GrpcClient
+	userpb.UnsafeUserServiceServer
+	sessionClient sessionpb.SessionServiceClient
 }
 
 func NewGrpcServer(db *gorm.DB) *GrpcServer {
 	repo := repository.NewUserRepository(db)
-	service := service.NewUserService(repo)
-	grpcClient, _ := sessionClient.NewGrpcClient("localhost:50054")
+	service := service.NewUserService(db, repo)
+	env := os.Getenv("ENVIRONMENT")
+	var sessionUrl string
+	sessionPort := os.Getenv("SESSION_SERVICE_PORT")
+
+	switch env {
+	case "local", "":
+		sessionUrl = fmt.Sprintf("localhost:%s", sessionPort)
+	case "dev":
+		sessionUrl = fmt.Sprintf("session-service:%s", sessionPort)
+	case "azure":
+		sessionAppUrl := os.Getenv("SESSION_CONTAINER_APP_URL")
+		sessionPort:= os.Getenv("SESSION_SERVICE_PORT")
+		sessionUrl = fmt.Sprintf("%s:%s",sessionAppUrl,sessionPort)
+	default:
+		fmt.Printf("Invalid environment on user grpc server")
+	}
+	log.Printf("session url: %s",sessionUrl)
+	
+	conn, err := grpc.NewClient(sessionUrl,grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil || conn == nil{
+		return nil
+	}
+
+	sessionClient := sessionpb.NewSessionServiceClient(conn)
+
 	return &GrpcServer{
 		userDB:        db,
 		userRepo:      repo,
 		userService:   *service,
-		sessionClient: *grpcClient,
+		sessionClient: sessionClient,
 	}
 }
+
+
 
 // Should only create a user not a session
-func (g *GrpcServer) Register(ctx context.Context, user *pb.User) (*pb.User, error) {
-	user, err := g.userService.Register(ctx, user)
-	if err != nil {
-		return nil, err
+func (g *GrpcServer) RegisterUser(ctx context.Context, registerRequestPb *userpb.RegisterUserRequest) (*userpb.RegisterUserResponse, error) {
+	if registerRequestPb == nil || registerRequestPb.Username == "" || registerRequestPb.Email == "" || registerRequestPb.Password == "" {
+		return nil, status.Error(codes.InvalidArgument, "username, email and password are required for registration")
 	}
-	return user, nil
+	res, err := g.userService.Register(ctx, service.RegisterUserInput{
+		Username: registerRequestPb.Username,
+		Email:    registerRequestPb.Email,
+		Password: registerRequestPb.Password,
+	})
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("%v", err))
+	}
+
+	return &userpb.RegisterUserResponse{
+		Username: res.Username,
+		Email:    res.Email,
+	}, nil
 }
 
-// Note to future maintainers: Assume that user (and Gateway) doesn't know its ID for it is provided
-//
-//	at the time of successful registration and/or login. Therefore, asking for ID on login forwards
-//	the nil value to other services creating hard to find errors.
-//
-//	Also, username is an unique key!
-func (g *GrpcServer) Login(ctx context.Context, loginRequest *pb.LoginRequest) (*pb.LoginResponse, error) {
-
-	//Check if the session exists with token and userID
-	userID := &sessionpb.UserID{
-		UserID: loginRequest.GetUserID(),
+func (g *GrpcServer) LoginUser(ctx context.Context, loginRequest *userpb.LoginUserRequest) (*userpb.LoginUserResponse, error) {
+	if loginRequest == nil || loginRequest.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username and password are required for login")
 	}
 
-	sessionPb, _ := g.sessionClient.GetSessionByUserID(ctx, userID)
+	username := loginRequest.Username
+	passedToken := loginRequest.Token
+	password := loginRequest.Password
 
-	// Retrieves access token, already in session
-	if sessionPb != nil {
-
-		log.Println("Refreshing session for user ", loginRequest.GetUsername())
-		return &pb.LoginResponse{
-			UserID:      sessionPb.GetUserID(),
-			Username:    loginRequest.Username,
-			AccessToken: sessionPb.GetAccessToken(),
-		}, nil
-	} else {
-
-		log.Print("Validating session for user ", loginRequest.GetUsername())
-
-		// User logging in first time: Check username and password
-		isLoggedIn, err := g.userService.Login(ctx, loginRequest.GetUsername(), loginRequest.GetPassword())
-		if err != nil {
-			log.Println("...AUTHORIZATION FAILED!")
-			return nil, err
-		}
-		if isLoggedIn {
-
-			log.Println("...OK")
-			// Get the id from the database for user doesn't need to supply it in the request!
-			user, err := g.userRepo.GetUserByUsername(context.Background(), loginRequest.Username)
-			if err != nil {
-				fmt.Print(err)
-				return nil, err
-			}
-
-			createdSessionPb, err := g.sessionClient.CreateSession(ctx, &sessionpb.Session{UserID: user.ID})
-			if err != nil {
-				fmt.Print(err)
-				return nil, err
-			}
-			return &pb.LoginResponse{
-				UserID:      user.ID,
-				Username:    loginRequest.GetUsername(),
-				AccessToken: createdSessionPb.AccessToken,
-			}, nil
+	if passedToken != "" {
+		verified, _ := g.userService.VerifyToken(ctx, service.TokenInput{
+			Token: passedToken,
+		})
+		if verified {
+			return &userpb.LoginUserResponse{Username: username, AccessToken: passedToken}, nil
 		} else {
-			log.Println("...Invalid credentials.")
-			return nil, errors.New("invalid credentials")
+			log.Print("Token is invalid, continue with credential checking")
 		}
 	}
 
+	log.Println("Checking user credentials")
+	isLoggedIn, _ := g.userService.Login(ctx, service.LoginUserInput{Username: username, Password: password})
+	if !isLoggedIn {
+		return nil, errors.New("Authentification failed")
+	}
+	log.Println("Successful authentication creating session...")
+	var token string
+	var err error
+	if token, err = g.userService.CreateToken(ctx, service.CreateTokenInput{Username: username, Duration: 24 * time.Hour}); err != nil {
+		return nil, fmt.Errorf("Failed to create auth token for user %v : %v", username, err)
+	}
+	_, err = g.sessionClient.Connect(ctx, &sessionpb.ConnectRequest{Username: username})
+	if err != nil {
+		return nil, fmt.Errorf("Failed session sign in for user %v : %v ", username, err)
+	}
+
+	log.Print("Succesfull login")
+	return &userpb.LoginUserResponse{Username: username, AccessToken: token}, nil
+
+}
+
+func (g *GrpcServer) LogoutUser(ctx context.Context, logoutRequest *userpb.LogoutUserRequest) (*emptypb.Empty, error) {
+	if logoutRequest.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username cannot be nil for logout")
+	}
+	usernamePb := &sessionpb.DisconnectRequest{Username: logoutRequest.Username}
+	if _, err := g.sessionClient.Disconnect(ctx, usernamePb); err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
+}
+
+func (g *GrpcServer) ValidateUserAccount(ctx context.Context, validateRequest *userpb.ValidateUserAccountRequest) (*emptypb.Empty, error) {
+	if validateRequest == nil || validateRequest.Username == "" || validateRequest.AuthCode == "" {
+		return nil, status.Error(codes.InvalidArgument, "invalid arguments for account validation")
+	}
+	if err := g.userService.ValidateAccount(ctx,
+		service.ValidateAccountInput{Username: validateRequest.Username, AuthCode: validateRequest.AuthCode}); err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
+}
+
+func (g *GrpcServer) VerifyToken(ctx context.Context, verifyTokenRequest *userpb.VerifyTokenRequest) (*wrapperspb.BoolValue, error) {
+	if verifyTokenRequest == nil || verifyTokenRequest.Token == "" {
+		return wrapperspb.Bool(false), status.Error(codes.InvalidArgument, "cannot verify empty token")
+	}
+
+	if valid, err := g.userService.VerifyToken(ctx, service.TokenInput{Token: verifyTokenRequest.Token}); !valid || err != nil {
+		return wrapperspb.Bool(false), err
+	}
+	return wrapperspb.Bool(true), nil
+}
+
+func (g *GrpcServer) DecodeAccessToken(ctx context.Context, decodeRequest *userpb.DecodeAccessTokenRequest) (*userpb.DecodeAccessTokenResponse, error) {
+	if decodeRequest == nil || decodeRequest.Token == "" {
+		return nil, status.Error(codes.InvalidArgument, "invalid parameters")
+	}
+	username, err := g.userService.DecodeAccessToken(ctx, service.DecodeAccessTokenInput{Token: decodeRequest.Token})
+	if err != nil {
+		return nil, status.Error(codes.NotFound, "couldn't return access token payload")
+	}
+	return &userpb.DecodeAccessTokenResponse{Username: username}, nil
+}
+
+func (g *GrpcServer) CreateContact(ctx context.Context, contactRequest *userpb.CreateContactRequest) (*userpb.CreateContactResponse, error) {
+	if contactRequest == nil || contactRequest.Username == "" || contactRequest.ContactName == "" {
+		return nil, status.Error(codes.InvalidArgument, "invalid arguments for contact creation")
+	}
+	contactInput := &service.CreateContactInput{
+		Username:    contactRequest.Username,
+		ContactName: contactRequest.ContactName,
+		Nickname:    contactRequest.Nickname,
+	}
+
+	contact, err := g.userService.CreateContact(ctx, contactInput)
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, fmt.Sprint(err))
+	}
+	contactRes := &userpb.CreateContactResponse{
+		Username:    contact.Username,
+		ContactName: contact.ContactName,
+		Nickname:    contact.Nickname,
+		CreatedAt:   timestamppb.New(contact.CreatedAt),
+	}
+
+	return contactRes, nil
+}
+
+func (g *GrpcServer) DeleteContact(ctx context.Context, contactRequest *userpb.DeleteContactRequest) (*emptypb.Empty, error) {
+	if contactRequest == nil || contactRequest.Username == "" || contactRequest.ContactName == "" {
+		return nil, status.Error(codes.InvalidArgument, "invalid arguments for contact deletion")
+	}
+
+	contactInput := &service.DeleteContactInput{
+		Username:    contactRequest.Username,
+		ContactName: contactRequest.ContactName,
+	}
+
+	err := g.userService.DeleteContact(ctx, contactInput)
+	return &emptypb.Empty{}, err
+}
+
+func (g *GrpcServer) GetContacts(contactRequest *userpb.GetContactsRequest, stream userpb.UserService_GetContactsServer) error {
+	if contactRequest == nil || contactRequest.Username == "" {
+		return status.Error(codes.InvalidArgument, "invalid arguments for contact retreival")
+	}
+
+	ctx := stream.Context()
+	return g.userService.GetContactsStream(ctx, &service.GetContactsInput{Username: contactRequest.Username, SearchCriteria: contactRequest.SearchCriteria}, func(c models.Contact) error {
+		return stream.Send(&userpb.GetContactResponse{
+			Username:    c.Username,
+			ContactName: c.ContactName,
+			Nickname:    c.Nickname,
+		})
+	})
+
+}
+
+func (g *GrpcServer) UpdateContact(ctx context.Context, contactRequest *userpb.UpdateContactRequest) (*userpb.UpdateContactResponse, error) {
+	if contactRequest == nil || contactRequest.Username == "" || contactRequest.ContactName == "" {
+		return nil, status.Error(codes.InvalidArgument, "invalid arguments for contact update")
+	}
+
+	contactInput := &service.UpdateContactInput{
+		Username:    contactRequest.Username,
+		ContactName: contactRequest.ContactName,
+		Nickname:    contactRequest.Nickname,
+	}
+
+	contact, err := g.userService.UpdateContact(ctx, contactInput)
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, "system couldn't update a contact")
+	}
+	contactRes := &userpb.UpdateContactResponse{
+		Username:    contact.Username,
+		ContactName: contact.ContactName,
+		Nickname:    contact.Nickname,
+	}
+	return contactRes, nil
 }

@@ -1,11 +1,10 @@
 package clients
 
 import (
-	"context"
 	"errors"
-	"time"
+	"log"
 
-	sessionpb "github.com/Abelova-Grupa/Mercypher/session-service/external/proto"
+	sessionpb "github.com/Abelova-Grupa/Mercypher/proto/session"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -21,6 +20,8 @@ type SessionClient struct {
 //			connection fails or refuses it wont be registered. Only when sending
 //			messages to an unexisting address will the error be thrown.
 func NewSessionClient(address string) (*SessionClient, error){
+	log.Printf("SESSION: Connecting to gRPC address: '%s'", address)
+	// isSecure := (os.Getenv("ENVIRONMENT") == "azure")
 	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, err
@@ -32,6 +33,9 @@ func NewSessionClient(address string) (*SessionClient, error){
 
 	client := sessionpb.NewSessionServiceClient(conn)
 
+	state := conn.GetState()
+	log.Printf("SESSION: Connection state: %s", state)
+
 	return &SessionClient{
 		conn: 	conn,
 		client: client,
@@ -42,46 +46,15 @@ func (c *SessionClient) Close() error {
 	return c.conn.Close()
 }
 
-func (c *SessionClient) VerifyToken(token string) (bool, error) {
-	resp, err := c.client.VerifyToken(context.Background(), &sessionpb.Token{
-		Token: token,
-		TokenType: "access",
-	})
-	if err != nil {
-		return false, err
-	} else {
-		return resp.IsValid, nil
-	}
-}
-
-
-// TODO: Find a way to get the address
-func (c *SessionClient) CreateUserLocation(user_id string, address string) error {
-	return nil
-}
-
-func (c *SessionClient) UpdateUserLocation(user_id string, address string) error {
-	return nil
-}
-
-func (c *SessionClient) DeleteUserLocation(user_id string) error {
-	return nil
-}
-
-func (c *SessionClient) CreateLastSeen(user_id string) error {
-	return nil
-}
-
-func (c *SessionClient) GetLastSeen(user_id string) (time.Time, error) {
-	return time.Now(), nil
-}
-
-func (c *SessionClient) UpdateLastSeen(user_id string, timestamp time.Time) error {
-	return nil
-}
-
-func (c *SessionClient) DeleteLastSeen(user_id string) error {
-	return nil
-}
+// func (c *SessionClient) VerifyToken(token string) (bool, error) {
+// 	resp, err := c.client.VerifyToken(context.Background(), &sessionpb.Token{
+// 		Token: token,
+// 	})
+// 	if err != nil {
+// 		return false, err
+// 	} else {
+// 		return resp.Value, nil
+// 	}
+// }
 
 

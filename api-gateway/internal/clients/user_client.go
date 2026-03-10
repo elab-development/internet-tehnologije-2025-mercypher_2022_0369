@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"time"
 
-	"github.com/Abelova-Grupa/Mercypher/api/internal/domain"
-	userpb "github.com/Abelova-Grupa/Mercypher/user-service/external/proto"
+	"github.com/Abelova-Grupa/Mercypher/api-gateway/internal/domain"
+	userpb "github.com/Abelova-Grupa/Mercypher/proto/user"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -33,6 +37,9 @@ func NewUserClient(address string) (*UserClient, error) {
 		return nil, errors.New("Connection refused: nil")
 	}
 
+	state := conn.GetState()
+	log.Printf("USER: Connection state: %s", state)
+
 	client := userpb.NewUserServiceClient(conn)
 
 	return &UserClient{
@@ -47,31 +54,39 @@ func (c *UserClient) Close() error {
 
 // Register method returns ID of the created user.
 func (c *UserClient) Register(user domain.User, password string) (string, error) {
-	response, err := c.client.Register(context.Background(),
-		&userpb.User{
-			ID:        user.UserId,
+	log.Printf("DEBUG: Slanje zahteva ka user servisu")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+	
+	response, err := c.client.RegisterUser(ctx,
+		&userpb.RegisterUserRequest{
 			Username:  user.Username,
 			Email:     user.Email,
 			Password:  password,
 			CreatedAt: timestamppb.Now(),
 		})
 	fmt.Print(response)
-
+	
 	if err != nil {
-		return "", err
-	}
+        // OVO JE NAJVAŽNIJA LINIJA: šta ovde piše?
+        log.Printf("CRITICAL: gRPC error code: %v, details: %v", status.Code(err), err)
+        return "", err
+    }
 
-	return response.ID, nil
+	// if err != nil {
+	// 	return "", err
+	// }
+
+	return response.Username, nil
 }
 
 // Login method returns access token of the logged user
 func (c *UserClient) Login(user domain.User, password string, accessToken string) (string, error) {
-	response, err := c.client.Login(context.Background(),
-		&userpb.LoginRequest{
-			UserID:      user.UserId,
-			Username:    user.Username, // Redundant?
-			Password:    password,
-			AccessToken: accessToken,
+	response, err := c.client.LoginUser(context.Background(),
+		&userpb.LoginUserRequest{
+			Username: user.Username, // Redundant?
+			Password: password,
+			Token:    accessToken,
 		})
 
 	if err != nil {
@@ -80,4 +95,93 @@ func (c *UserClient) Login(user domain.User, password string, accessToken string
 	}
 
 	return response.AccessToken, nil
+}
+
+func (c *UserClient) VerifyToken(token string) (bool, error) {
+	resp, err := c.client.VerifyToken(context.Background(), &userpb.VerifyTokenRequest{
+		Token: token,
+	})
+	if err != nil {
+		return false, err
+	} else {
+		return resp.Value, nil
+	}
+}
+
+func (c *UserClient) DecodeToken(token string) (string, error) {
+	resp, err := c.client.DecodeAccessToken(context.Background(), &userpb.DecodeAccessTokenRequest{Token: token})
+	if err != nil {
+		return "", err
+	} else {
+		return resp.Username, nil
+	}
+}
+
+func (c *UserClient) CreateContact(username string, contact string, nick string) error {
+	_, err := c.client.CreateContact(context.Background(), &userpb.CreateContactRequest{
+		Username:    username,
+		ContactName: contact,
+		Nickname: nick,
+	})
+
+	return err
+}
+
+func (c *UserClient) UpdateContact(username string, contact string, nick string) error {
+	_, err := c.client.UpdateContact(context.Background(), &userpb.UpdateContactRequest{
+	Username:    username,
+		ContactName: contact,
+		Nickname: nick,
+	})
+
+	return err
+}
+
+func (c *UserClient) DeleteContact(username string, contact string) error {
+	_, err := c.client.DeleteContact(context.Background(), &userpb.DeleteContactRequest{
+		Username:    username,
+		ContactName: contact,
+	})
+
+	return err
+}
+
+// Drzi vodu
+type Contact struct {
+	Username string `json:"username"`
+	Nickname string `json:"nickname"`
+}
+
+func (c *UserClient) GetContacts(username string) ([]Contact, error) {
+	stream, err := c.client.GetContacts(context.Background(), &userpb.GetContactsRequest{
+		Username: username,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var contacts []Contact
+
+	for {
+		contact, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to read contact.")
+		}
+
+		contacts = append(contacts, Contact{Username: contact.ContactName, Nickname: contact.Nickname})
+	}
+
+	return contacts, nil
+}
+
+func (c *UserClient) ValidateAccount(username string, authCode string) error {
+	_, err := c.client.ValidateUserAccount(context.Background(), &userpb.ValidateUserAccountRequest{
+		Username: username,
+		AuthCode: authCode,
+	})
+
+	return err
 }
